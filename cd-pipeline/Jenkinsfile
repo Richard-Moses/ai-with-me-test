@@ -1,0 +1,194 @@
+// Task 6: one pipeline that does everything.
+//   Terraform (AWS servers) -> Ansible (Docker, Kubernetes) -> kubectl (app) -> monitoring
+// The image itself is built and pushed by the root Jenkinsfile (Task 4). This pipeline deploys it.
+//
+// Jenkins credentials needed:
+//   aws-credentials   Username with password   AWS access key ID (username) + secret access key (password)
+//   oeson-ssh-key     SSH username with key    user "ubuntu" + the private key of the "oeson-key" key pair
+//
+// Jenkins server needs: terraform, ansible, kubectl (install-jenkins.yml installs them).
+// Terraform state is kept in this job's workspace (infra/terraform/terraform.tfstate).
+// Do not wipe the workspace, or Terraform forgets the servers it created.
+//
+// Actions: "plan" only previews. "apply" creates/updates the servers AND configures them AND deploys
+// the app and monitoring (re-running apply with no changes is safe and redeploys). "destroy" deletes everything.
+
+pipeline {
+    agent any
+
+    parameters {
+        choice(name: 'TERRAFORM_ACTION', choices: ['plan', 'apply', 'destroy'],
+               description: 'plan = preview only (default, safe). apply = create/update the AWS servers (costs money). destroy = delete them.')
+        string(name: 'ALLOWED_SSH_CIDR', defaultValue: '',
+               description: 'Your public IP with /32, for example 203.0.113.10/32 (SSH, Jenkins and Kubernetes API access)')
+        booleanParam(name: 'USE_PRIVATE_IPS', defaultValue: true,
+                     description: 'Tick when this Jenkins runs inside the AWS VPC (the jenkins-host). Untick when it runs on your own machine.')
+        booleanParam(name: 'INSTALL_JENKINS', defaultValue: false,
+                     description: 'Install Jenkins with Ansible. Only for a first run from another machine. NEVER tick on the Jenkins server itself (it restarts Jenkins).')
+        string(name: 'IMAGE_TAG', defaultValue: 'latest',
+               description: 'Docker image tag to deploy, for example 1.0.7 (builds from the root Jenkinsfile)')
+        booleanParam(name: 'DEPLOY_APP', defaultValue: true, description: 'Deploy the microservice with kubectl')
+        booleanParam(name: 'DEPLOY_MONITORING', defaultValue: true, description: 'Deploy Prometheus and Grafana')
+    }
+
+    environment {
+        DOCKERHUB_USER             = 'mosesr'
+        APP_NAME                   = 'oeson-microservice'
+        NAMESPACE                  = 'microservices'
+        TF_IN_AUTOMATION           = 'true'
+        ANSIBLE_HOST_KEY_CHECKING  = 'False'
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        timeout(time: 90, unit: 'MINUTES')
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                withCredentials([
+                    usernamePassword(credentialsId: 'aws-credentials',
+                                     usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                     passwordVariable: 'AWS_SECRET_ACCESS_KEY'),
+                    sshUserPrivateKey(credentialsId: 'oeson-ssh-key', keyFileVariable: 'SSH_KEY')
+                ]) {
+                    dir('infra/terraform') {
+                        sh '''
+                            test -n "$ALLOWED_SSH_CIDR" || { echo "Set the ALLOWED_SSH_CIDR parameter (your IP/32)"; exit 1; }
+                            ssh-keygen -y -f "$SSH_KEY" > "$WORKSPACE/oeson_key.pub"
+                            terraform init -input=false
+                            MODE=""
+                            [ "$TERRAFORM_ACTION" = "destroy" ] && MODE="-destroy"
+                            terraform plan -input=false $MODE -out=tfplan \
+                              -var "allowed_ssh_cidr=$ALLOWED_SSH_CIDR" \
+                              -var "public_key_path=$WORKSPACE/oeson_key.pub"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Approve Terraform') {
+            when { expression { params.TERRAFORM_ACTION != 'plan' } }
+            steps {
+                input message: "Run 'terraform ${params.TERRAFORM_ACTION}' on AWS? Real resources will be changed and may cost money.",
+                      ok: 'Yes, go ahead'
+            }
+        }
+
+        stage('Terraform Apply') {
+            when { expression { params.TERRAFORM_ACTION != 'plan' } }
+            steps {
+                withCredentials([
+                    usernamePassword(credentialsId: 'aws-credentials',
+                                     usernameVariable: 'AWS_ACCESS_KEY_ID',
+                                     passwordVariable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    dir('infra/terraform') {
+                        sh 'terraform apply -input=false tfplan'
+                    }
+                }
+            }
+        }
+
+        stage('Write Ansible Inventory') {
+            when { expression { params.TERRAFORM_ACTION == 'apply' } }
+            steps {
+                sh 'sh scripts/write-inventory.sh'
+            }
+        }
+
+        stage('Configure Servers (Ansible)') {
+            when { expression { params.TERRAFORM_ACTION == 'apply' } }
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'oeson-ssh-key', keyFileVariable: 'SSH_KEY')]) {
+                    dir('ansible') {
+                        sh '''
+                            ansible-galaxy collection install -r requirements.yml || true
+                            ansible all -i inventory.ini --private-key "$SSH_KEY" \
+                              -m ansible.builtin.wait_for_connection -a "timeout=300"
+
+                            ansible-playbook -i inventory.ini --private-key "$SSH_KEY" playbooks/install-docker.yml
+
+                            if [ "$INSTALL_JENKINS" = "true" ]; then
+                                ansible-playbook -i inventory.ini --private-key "$SSH_KEY" playbooks/install-jenkins.yml
+                            fi
+
+                            ansible-playbook -i inventory.ini --private-key "$SSH_KEY" playbooks/install-k8s.yml
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Get Kubeconfig') {
+            when { expression { params.TERRAFORM_ACTION == 'apply' && (params.DEPLOY_APP || params.DEPLOY_MONITORING) } }
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'oeson-ssh-key', keyFileVariable: 'SSH_KEY')]) {
+                    dir('infra/terraform') {
+                        sh '''
+                            if [ "$USE_PRIVATE_IPS" = "true" ]; then
+                                MASTER=$(terraform output -raw k8s_node_1_private_ip)
+                            else
+                                MASTER=$(terraform output -raw k8s_node_1_public_ip)
+                            fi
+                            cd "$WORKSPACE"
+                            KUBECONFIG_OUT="$WORKSPACE/kubeconfig" sh scripts/init-kubeconfig.sh "$MASTER" "$SSH_KEY"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploy App (kubectl)') {
+            when { expression { params.TERRAFORM_ACTION == 'apply' && params.DEPLOY_APP } }
+            steps {
+                sh '''
+                    export KUBECONFIG="$WORKSPACE/kubeconfig"
+                    ROLLOUT_TIMEOUT=240s sh scripts/deploy-app.sh "${DOCKERHUB_USER}/${APP_NAME}:${IMAGE_TAG}"
+                '''
+            }
+        }
+
+        stage('Set Up Monitoring') {
+            when { expression { params.TERRAFORM_ACTION == 'apply' && params.DEPLOY_MONITORING } }
+            steps {
+                withCredentials([sshUserPrivateKey(credentialsId: 'oeson-ssh-key', keyFileVariable: 'SSH_KEY')]) {
+                    dir('ansible') {
+                        sh 'ansible-playbook -i inventory.ini --private-key "$SSH_KEY" playbooks/install-monitoring.yml'
+                    }
+                }
+            }
+        }
+
+        stage('Verify') {
+            when { expression { params.TERRAFORM_ACTION == 'apply' && (params.DEPLOY_APP || params.DEPLOY_MONITORING) } }
+            steps {
+                sh '''
+                    export KUBECONFIG="$WORKSPACE/kubeconfig"
+                    sh scripts/check-cluster.sh
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'rm -f kubeconfig oeson_key.pub'
+        }
+        success {
+            echo "Pipeline finished (terraform ${params.TERRAFORM_ACTION})."
+        }
+        failure {
+            echo 'Pipeline failed. Read the first red stage above.'
+        }
+    }
+}
