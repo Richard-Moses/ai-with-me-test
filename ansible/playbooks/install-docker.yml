@@ -1,0 +1,25 @@
+---
+# Docker is only needed on the Jenkins server (it builds the images).
+# The Kubernetes nodes use containerd, installed by install-k8s.yml.
+- name: Install Docker on the Jenkins server
+  hosts: jenkins
+  become: true
+  tasks:
+    - name: Install Docker from the Ubuntu repository
+      ansible.builtin.apt:
+        name: docker.io
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Enable and start Docker
+      ansible.builtin.service:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Let the ubuntu user run docker
+      ansible.builtin.user:
+        name: ubuntu
+        groups: docker
+        append: true

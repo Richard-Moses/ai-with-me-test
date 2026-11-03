@@ -1,0 +1,152 @@
+---
+# Installs Jenkins plus the tools the pipelines call: Docker group access, kubectl, Terraform, Ansible, Git.
+# Run install-docker.yml first.
+# WARNING: do not run this from a build on the Jenkins server itself the first time; it starts/restarts Jenkins.
+- name: Install Jenkins and its tools
+  hosts: jenkins
+  become: true
+  vars:
+    k8s_version: "v1.30"
+  tasks:
+    - name: Install base packages
+      ansible.builtin.apt:
+        name:
+          - openjdk-17-jre-headless
+          - git
+          - curl
+          - unzip
+          - ca-certificates
+          - gnupg
+          - ansible
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    # 1 GB of RAM is tight for Jenkins; add a 2 GB swap file on this server only
+    - name: Create a swap file
+      ansible.builtin.command:
+        cmd: fallocate -l 2G /swapfile
+        creates: /swapfile
+
+    - name: Restrict swap file permissions
+      ansible.builtin.file:
+        path: /swapfile
+        mode: "0600"
+
+    - name: Format the swap file
+      ansible.builtin.command:
+        cmd: mkswap /swapfile
+      when: ansible_swaptotal_mb | int == 0
+      changed_when: true
+
+    - name: Turn the swap file on
+      ansible.builtin.command:
+        cmd: swapon /swapfile
+      when: ansible_swaptotal_mb | int == 0
+      changed_when: true
+
+    - name: Keep the swap file after reboot
+      ansible.builtin.lineinfile:
+        path: /etc/fstab
+        line: "/swapfile none swap sw 0 0"
+        state: present
+
+    - name: Add the Jenkins repository key
+      ansible.builtin.get_url:
+        url: https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+        dest: /usr/share/keyrings/jenkins-keyring.asc
+        mode: "0644"
+
+    - name: Add the Jenkins repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] https://pkg.jenkins.io/debian-stable binary/"
+        filename: jenkins
+        state: present
+
+    - name: Add the Kubernetes repository key
+      ansible.builtin.get_url:
+        url: "https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/Release.key"
+        dest: /etc/apt/keyrings/kubernetes.asc
+        mode: "0644"
+
+    - name: Add the Kubernetes repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes.asc] https://pkgs.k8s.io/core:/stable:/{{ k8s_version }}/deb/ /"
+        filename: kubernetes
+        state: present
+
+    - name: Add the HashiCorp repository key
+      ansible.builtin.get_url:
+        url: https://apt.releases.hashicorp.com/gpg
+        dest: /etc/apt/keyrings/hashicorp.asc
+        mode: "0644"
+
+    - name: Add the HashiCorp repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/hashicorp.asc] https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main"
+        filename: hashicorp
+        state: present
+
+    - name: Install Jenkins, kubectl and Terraform
+      ansible.builtin.apt:
+        name:
+          - jenkins
+          - kubectl
+          - terraform
+        state: present
+        update_cache: true
+
+    - name: Let the jenkins user run docker
+      ansible.builtin.user:
+        name: jenkins
+        groups: docker
+        append: true
+
+    - name: Make sure the override folder exists
+      ansible.builtin.file:
+        path: /etc/systemd/system/jenkins.service.d
+        state: directory
+        mode: "0755"
+
+    - name: Limit Jenkins memory use
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/jenkins.service.d/override.conf
+        content: |
+          [Service]
+          Environment="JAVA_OPTS=-Djava.awt.headless=true -Xmx512m"
+        mode: "0644"
+      notify:
+        - Reload systemd
+        - Restart Jenkins
+
+    - name: Enable and start Jenkins
+      ansible.builtin.service:
+        name: jenkins
+        state: started
+        enabled: true
+
+    - name: Wait for Jenkins on port 8080
+      ansible.builtin.wait_for:
+        port: 8080
+        timeout: 180
+
+    - name: Read the initial admin password
+      ansible.builtin.slurp:
+        src: /var/lib/jenkins/secrets/initialAdminPassword
+      register: jenkins_initial_password
+      failed_when: false
+
+    - name: Show the initial admin password
+      ansible.builtin.debug:
+        msg: "Jenkins initial admin password: {{ jenkins_initial_password.content | b64decode | trim }}"
+      when: jenkins_initial_password.content is defined
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart Jenkins
+      ansible.builtin.service:
+        name: jenkins
+        state: restarted

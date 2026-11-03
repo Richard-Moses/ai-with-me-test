@@ -1,0 +1,40 @@
+---
+# Deploys the microservice from the control plane node (handy for a manual first deploy).
+#   ansible-playbook playbooks/setup-app.yml -e image_tag=1.0.1
+- name: Deploy the microservice
+  hosts: k8s_master
+  become: true
+  vars:
+    dockerhub_user: mosesr
+    image_tag: latest
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  tasks:
+    - name: Copy the Kubernetes manifests
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../k8s/"
+        dest: /opt/oeson/k8s/
+        mode: preserve
+
+    - name: Point the Deployment at the chosen image tag
+      ansible.builtin.replace:
+        path: /opt/oeson/k8s/deployment.yaml
+        regexp: 'image: .*oeson-microservice:.*'
+        replace: "image: {{ dockerhub_user }}/oeson-microservice:{{ image_tag }}"
+
+    - name: Create the namespace first
+      ansible.builtin.command:
+        cmd: kubectl apply -f /opt/oeson/k8s/namespace.yaml
+      register: ns
+      changed_when: "'created' in ns.stdout or 'configured' in ns.stdout"
+
+    - name: Apply all manifests
+      ansible.builtin.command:
+        cmd: kubectl apply -f /opt/oeson/k8s/
+      register: app
+      changed_when: "'created' in app.stdout or 'configured' in app.stdout"
+
+    - name: Wait for the rollout
+      ansible.builtin.command:
+        cmd: kubectl rollout status deployment/oeson-microservice -n microservices --timeout=180s
+      changed_when: false

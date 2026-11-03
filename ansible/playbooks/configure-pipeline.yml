@@ -1,0 +1,52 @@
+---
+# Installs the Jenkins plugins the pipelines need. Run AFTER you have unlocked Jenkins in the browser
+# and created your admin user.
+#   ansible-playbook playbooks/configure-pipeline.yml -e jenkins_admin_password='YOUR_PASSWORD'
+# WARNING: this restarts Jenkins. Never run it from a build on the Jenkins server itself.
+- name: Install Jenkins plugins
+  hosts: jenkins
+  become: true
+  vars:
+    jenkins_url: http://localhost:8080
+    jenkins_admin_user: admin
+    jenkins_plugins:
+      - git
+      - workflow-aggregator
+      - docker-workflow
+      - credentials-binding
+      - ssh-agent
+      - job-dsl
+      - github
+      - timestamper
+  tasks:
+    - name: Make sure the admin password was given
+      ansible.builtin.assert:
+        that: jenkins_admin_password is defined
+        fail_msg: "Pass it with: -e jenkins_admin_password='YOUR_PASSWORD'"
+
+    - name: Install the plugins
+      community.general.jenkins_plugin:
+        name: "{{ item }}"
+        url: "{{ jenkins_url }}"
+        url_username: "{{ jenkins_admin_user }}"
+        url_password: "{{ jenkins_admin_password }}"
+        with_dependencies: true
+        state: present
+      loop: "{{ jenkins_plugins }}"
+      no_log: true
+      notify: Restart Jenkins
+
+    - name: Flush handlers so Jenkins restarts now
+      ansible.builtin.meta: flush_handlers
+
+    - name: Wait for Jenkins to come back
+      ansible.builtin.wait_for:
+        port: 8080
+        delay: 10
+        timeout: 240
+
+  handlers:
+    - name: Restart Jenkins
+      ansible.builtin.service:
+        name: jenkins
+        state: restarted

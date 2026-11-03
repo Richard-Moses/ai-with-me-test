@@ -1,0 +1,9 @@
+# Copy this file to terraform.tfvars and edit. terraform.tfvars is git-ignored.
+
+# Your public IP with /32 (find it by searching "what is my IP")
+allowed_ssh_cidr = "203.0.113.10/32"
+
+# Path to your SSH public key (create one with: ssh-keygen -t ed25519 -f ~/.ssh/oeson_key)
+public_key_path = "~/.ssh/oeson_key.pub"
+
+# aws_region = "eu-west-2"

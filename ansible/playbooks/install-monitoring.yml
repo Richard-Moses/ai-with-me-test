@@ -1,0 +1,51 @@
+---
+# Deploys Prometheus and Grafana (plain manifests from monitoring/) to the cluster. No Helm.
+- name: Deploy monitoring
+  hosts: k8s_master
+  become: true
+  environment:
+    KUBECONFIG: /etc/kubernetes/admin.conf
+  tasks:
+    - name: Copy the monitoring manifests to the control plane
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../monitoring/"
+        dest: /opt/oeson/monitoring/
+        mode: preserve
+
+    - name: Create the monitoring namespace
+      ansible.builtin.command:
+        cmd: kubectl apply -f /opt/oeson/monitoring/namespace.yaml
+      register: ns
+      changed_when: "'created' in ns.stdout or 'configured' in ns.stdout"
+
+    - name: Create Prometheus permissions
+      ansible.builtin.command:
+        cmd: kubectl apply -f /opt/oeson/monitoring/prometheus/rbac.yaml
+      register: rbac
+      changed_when: "'created' in rbac.stdout or 'configured' in rbac.stdout"
+
+    - name: Deploy Prometheus
+      ansible.builtin.command:
+        cmd: kubectl apply -f /opt/oeson/monitoring/prometheus/
+      register: prom
+      changed_when: "'created' in prom.stdout or 'configured' in prom.stdout"
+
+    - name: Deploy Grafana
+      ansible.builtin.command:
+        cmd: kubectl apply -f /opt/oeson/monitoring/grafana/
+      register: graf
+      changed_when: "'created' in graf.stdout or 'configured' in graf.stdout"
+
+    - name: Wait for Prometheus and Grafana
+      ansible.builtin.command:
+        cmd: "kubectl rollout status deployment/{{ item }} -n monitoring --timeout=300s"
+      loop:
+        - monitoring-prometheus
+        - monitoring-grafana
+      changed_when: false
+
+    - name: Where to find them
+      ansible.builtin.debug:
+        msg:
+          - "Grafana:    http://{{ public_ip }}:30300  (admin / admin, change it)"
+          - "Prometheus: http://{{ public_ip }}:30090"

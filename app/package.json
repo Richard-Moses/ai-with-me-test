@@ -1,0 +1,17 @@
+{
+  "name": "oeson-microservice",
+  "version": "1.0.0",
+  "description": "Small Express microservice for the Oeson CI/CD capstone",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test tests/test_basic.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "prom-client": "^15.1.3"
+  }
+}

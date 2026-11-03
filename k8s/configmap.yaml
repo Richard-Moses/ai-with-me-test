@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: oeson-microservice-config
+  namespace: microservices
+  labels:
+    app: oeson-microservice
+data:
+  PORT: "8080"
+  APP_ENV: "production"

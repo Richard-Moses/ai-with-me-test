@@ -1,0 +1,11 @@
+node_modules/
+.env
+*.log
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.DS_Store
+kubeconfig
+oeson_key.pub
+tfplan
